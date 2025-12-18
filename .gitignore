@@ -1,0 +1,25 @@
+# ---- Python venvs ----
+pcautomate/
+.venv/
+venv/
+env/
+
+# ---- Python caches ----
+__pycache__/
+*.py[cod]
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ---- Logs / temp ----
+*.log
+scratch.txt
+
+# ---- Build artifacts ----
+build/
+dist/
+*.egg-info/
+scratch.txt

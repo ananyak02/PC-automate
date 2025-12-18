@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Remote Scan Trigger</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #f4f4f4; display: flex; height: 100vh; justify-content: center; align-items: center; }
+    #container { background: white; padding: 40px; border-radius: 12px; box-shadow: 0 0 15px rgba(0,0,0,0.1); text-align: center; min-width: 400px; }
+    button { padding: 12px 24px; font-size: 16px; margin: 10px; color: white; border: none; border-radius: 6px; cursor: pointer; transition: background-color 0.3s; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    #startBtn { background-color: #4CAF50; }
+    #downloadBtn { background-color: #2196F3; }
+    #pauseBtn { background-color: #ff9800; }
+    #stopBtn { background-color: #f44336; }
+    #status { margin-top: 20px; font-weight: bold; min-height: 24px; }
+    .hidden { display: none; }
+    select { padding: 8px; font-size: 16px; margin: 10px; border-radius: 4px; border: 1px solid #ccc; }
+    label { font-weight: bold; margin-right: 10px; }
+  </style>
+</head>
+<body>
+  <div id="container">
+    <h2>FARO Remote Scan Control</h2>
+
+    <div>
+      <label for="cameraSelect">Select Camera:</label>
+      <select id="cameraSelect">
+        <option value="50">Camera 50 (141.70.213.50)</option>
+        <option value="51">Camera 51 (141.70.213.51)</option>
+      </select>
+    </div>
+
+    <div style="margin-top: 20px;">
+      <button id="startBtn" onclick="startScan()">Start Scan</button>
+    </div>
+
+    <div id="controlButtons" class="hidden" style="margin-top: 10px;">
+      <button id="pauseBtn" onclick="pauseScan()">Pause Scan</button>
+      <button id="stopBtn" onclick="stopScan()">Stop Scan</button>
+    </div>
+
+    <div id="downloadSection" class="hidden" style="margin-top: 10px;">
+      <button id="downloadBtn" onclick="downloadFile()">Download File</button>
+    </div>
+
+    <div id="status"></div>
+  </div>
+
+  <script>
+    let scanInProgress = false;
+
+    // what we show vs what we download
+    let scannedDisplayName = "";
+    let scannedDownloadName = ""; // IMPORTANT: this is like "...fls.zip"
+
+    async function startScan() {
+      const status = document.getElementById("status");
+      const startBtn = document.getElementById("startBtn");
+      const controlButtons = document.getElementById("controlButtons");
+      const downloadSection = document.getElementById("downloadSection");
+      const selectedIP = document.getElementById("cameraSelect").value;
+
+      status.innerText = "Scan started... Please wait.";
+      startBtn.disabled = true;
+      scanInProgress = true;
+      scannedDisplayName = "";
+      scannedDownloadName = "";
+
+      controlButtons.classList.remove("hidden");
+      downloadSection.classList.add("hidden");
+
+      try {
+        const response = await fetch(`http://localhost:5000/trigger-scan?ip=${selectedIP}`);
+        const data = await response.json();
+
+        if (!response.ok) throw new Error(data.message || "Scan failed.");
+
+        if ((data.message || "").includes("stopped")) {
+          status.innerText = "Scan stopped and deleted.";
+          return;
+        }
+
+        scannedDisplayName = data.file_name || "unknown";
+        scannedDownloadName = data.download_name || ""; // e.g. IP50_...fls.zip
+
+        status.innerText = `Scan complete! File: ${scannedDisplayName}`;
+
+        if (scannedDownloadName) {
+          downloadSection.classList.remove("hidden");
+        } else {
+          status.innerText += " (Download name missing — cannot download yet)";
+        }
+
+      } catch (err) {
+        console.error(err);
+        status.innerText = "Error: " + err.message;
+      } finally {
+        startBtn.disabled = false;
+        controlButtons.classList.add("hidden");
+        scanInProgress = false;
+      }
+    }
+
+    async function pauseScan() {
+      const status = document.getElementById("status");
+      const pauseBtn = document.getElementById("pauseBtn");
+      const selectedIP = document.getElementById("cameraSelect").value;
+
+      if (!scanInProgress) {
+        status.innerText = "No active scan to pause.";
+        return;
+      }
+
+      pauseBtn.disabled = true;
+      try {
+        status.innerText = "Sending pause request...";
+        const response = await fetch(`http://localhost:5000/pause-scan?ip=${selectedIP}`);
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.message || "Pause failed.");
+        status.innerText = "Pause requested. Check FARO interface to verify.";
+      } catch (err) {
+        console.error(err);
+        status.innerText = "Error: " + err.message;
+      } finally {
+        setTimeout(() => pauseBtn.disabled = false, 1500);
+      }
+    }
+
+    async function stopScan() {
+      const status = document.getElementById("status");
+      const stopBtn = document.getElementById("stopBtn");
+      const pauseBtn = document.getElementById("pauseBtn");
+      const selectedIP = document.getElementById("cameraSelect").value;
+
+      if (!scanInProgress) {
+        status.innerText = "No active scan to stop.";
+        return;
+      }
+
+      stopBtn.disabled = true;
+      pauseBtn.disabled = true;
+
+      try {
+        status.innerText = "Sending stop request...";
+        const response = await fetch(`http://localhost:5000/stop-scan?ip=${selectedIP}`);
+        //const data = await response.json();
+        let data = {};
+        try { data = await response.json(); } catch (e) { /* ignore non-json */ }
+
+        if (!response.ok) throw new Error(data.message || "Stop failed.");
+        status.innerText = "Stop requested. Scan will be deleted.";
+      } catch (err) {
+        console.error(err);
+        status.innerText = "Error: " + err.message;
+        stopBtn.disabled = false;
+        pauseBtn.disabled = false;
+      }
+    }
+
+    async function downloadFile() {
+      const status = document.getElementById("status");
+      const downloadBtn = document.getElementById("downloadBtn");
+      const selectedIP = document.getElementById("cameraSelect").value;
+
+      if (!scannedDownloadName) {
+        status.innerText = "No downloadable file name available.";
+        return;
+      }
+
+      downloadBtn.disabled = true;
+
+      try {
+        status.innerText = "Downloading file...";
+
+        // IMPORTANT: do NOT append ".zip" here. backend expects exact enclosure filename.
+        const response = await fetch(
+          `http://localhost:5000/download-file?name=${encodeURIComponent(scannedDownloadName)}&ip=${selectedIP}`
+        );
+
+        if (!response.ok) throw new Error("Download failed.");
+
+        const blob = await response.blob();
+        const url = window.URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = scannedDownloadName;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        window.URL.revokeObjectURL(url);
+
+        status.innerText = "File downloaded successfully!";
+      } catch (err) {
+        console.error(err);
+        status.innerText = "Error: " + err.message;
+      } finally {
+        downloadBtn.disabled = false;
+      }
+    }
+  </script>
+</body>
+</html>
