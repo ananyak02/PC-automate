@@ -5,17 +5,18 @@
   <title>Remote Scan Trigger</title>
   <style>
     body { font-family: Arial, sans-serif; background: #f4f4f4; display: flex; height: 100vh; justify-content: center; align-items: center; }
-    #container { background: white; padding: 40px; border-radius: 12px; box-shadow: 0 0 15px rgba(0,0,0,0.1); text-align: center; min-width: 400px; }
+    #container { background: white; padding: 40px; border-radius: 12px; box-shadow: 0 0 15px rgba(0,0,0,0.1); text-align: center; min-width: 420px; }
     button { padding: 12px 24px; font-size: 16px; margin: 10px; color: white; border: none; border-radius: 6px; cursor: pointer; transition: background-color 0.3s; }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
     #startBtn { background-color: #4CAF50; }
-    #downloadBtn { background-color: #2196F3; }
+    #downloadE57Btn { background-color: #2196F3; }
     #pauseBtn { background-color: #ff9800; }
     #stopBtn { background-color: #f44336; }
     #status { margin-top: 20px; font-weight: bold; min-height: 24px; }
     .hidden { display: none; }
     select { padding: 8px; font-size: 16px; margin: 10px; border-radius: 4px; border: 1px solid #ccc; }
     label { font-weight: bold; margin-right: 10px; }
+    .small { font-size: 12px; color: #666; margin-top: 6px; }
   </style>
 </head>
 <body>
@@ -25,8 +26,8 @@
     <div>
       <label for="cameraSelect">Select Camera:</label>
       <select id="cameraSelect">
-        <option value="50">Camera 50 (141.70.213.50)</option>
-        <option value="51">Camera 51 (141.70.213.51)</option>
+        <option value="50">Camera 50 </option>
+        <option value="51">Camera 51 </option>
       </select>
     </div>
 
@@ -40,7 +41,8 @@
     </div>
 
     <div id="downloadSection" class="hidden" style="margin-top: 10px;">
-      <button id="downloadBtn" onclick="downloadFile()">Download File</button>
+      <button id="downloadE57Btn" onclick="downloadE57()">Download E57</button>
+      <div class="small" id="e57Label"></div>
     </div>
 
     <div id="status"></div>
@@ -49,46 +51,50 @@
   <script>
     let scanInProgress = false;
 
-    // what we show vs what we download
-    let scannedDisplayName = "";
-    let scannedDownloadName = ""; // IMPORTANT: this is like "...fls.zip"
+    let e57Run = "";
+    let e57Name = "";
 
     async function startScan() {
       const status = document.getElementById("status");
       const startBtn = document.getElementById("startBtn");
       const controlButtons = document.getElementById("controlButtons");
       const downloadSection = document.getElementById("downloadSection");
+      const e57Label = document.getElementById("e57Label");
       const selectedIP = document.getElementById("cameraSelect").value;
 
       status.innerText = "Scan started... Please wait.";
       startBtn.disabled = true;
       scanInProgress = true;
-      scannedDisplayName = "";
-      scannedDownloadName = "";
+
+      e57Run = "";
+      e57Name = "";
+      e57Label.innerText = "";
 
       controlButtons.classList.remove("hidden");
       downloadSection.classList.add("hidden");
 
       try {
         const response = await fetch(`http://localhost:5000/trigger-scan?ip=${selectedIP}`);
+        if (!response.ok) {
+          const t = await response.text();
+          throw new Error(t || "Scan failed.");
+        }
         const data = await response.json();
-
-        if (!response.ok) throw new Error(data.message || "Scan failed.");
 
         if ((data.message || "").includes("stopped")) {
           status.innerText = "Scan stopped and deleted.";
           return;
         }
 
-        scannedDisplayName = data.file_name || "unknown";
-        scannedDownloadName = data.download_name || ""; // e.g. IP50_...fls.zip
+        if (data.e57_run && data.e57_name) {
+          e57Run = data.e57_run;
+          e57Name = data.e57_name;
 
-        status.innerText = `Scan complete! File: ${scannedDisplayName}`;
-
-        if (scannedDownloadName) {
+          status.innerText = `Scan complete and converted. Ready to download E57.`;
+          e57Label.innerText = `${e57Name}`;
           downloadSection.classList.remove("hidden");
         } else {
-          status.innerText += " (Download name missing — cannot download yet)";
+          status.innerText = "Scan complete, but conversion did not return an E57 file.";
         }
 
       } catch (err) {
@@ -143,9 +149,8 @@
       try {
         status.innerText = "Sending stop request...";
         const response = await fetch(`http://localhost:5000/stop-scan?ip=${selectedIP}`);
-        //const data = await response.json();
         let data = {};
-        try { data = await response.json(); } catch (e) { /* ignore non-json */ }
+        try { data = await response.json(); } catch (e) {}
 
         if (!response.ok) throw new Error(data.message || "Stop failed.");
         status.innerText = "Stop requested. Scan will be deleted.";
@@ -157,44 +162,40 @@
       }
     }
 
-    async function downloadFile() {
+    async function downloadE57() {
       const status = document.getElementById("status");
-      const downloadBtn = document.getElementById("downloadBtn");
-      const selectedIP = document.getElementById("cameraSelect").value;
+      const btn = document.getElementById("downloadE57Btn");
 
-      if (!scannedDownloadName) {
-        status.innerText = "No downloadable file name available.";
+      if (!e57Run || !e57Name) {
+        status.innerText = "No E57 file available to download.";
         return;
       }
 
-      downloadBtn.disabled = true;
-
+      btn.disabled = true;
       try {
-        status.innerText = "Downloading file...";
+        status.innerText = "Downloading E57...";
 
-        // IMPORTANT: do NOT append ".zip" here. backend expects exact enclosure filename.
         const response = await fetch(
-          `http://localhost:5000/download-file?name=${encodeURIComponent(scannedDownloadName)}&ip=${selectedIP}`
+          `http://localhost:5000/download-e57?run=${encodeURIComponent(e57Run)}&name=${encodeURIComponent(e57Name)}`
         );
-
         if (!response.ok) throw new Error("Download failed.");
 
         const blob = await response.blob();
         const url = window.URL.createObjectURL(blob);
         const link = document.createElement("a");
         link.href = url;
-        link.download = scannedDownloadName;
+        link.download = e57Name;
         document.body.appendChild(link);
         link.click();
         document.body.removeChild(link);
         window.URL.revokeObjectURL(url);
 
-        status.innerText = "File downloaded successfully!";
+        status.innerText = "E57 downloaded successfully!";
       } catch (err) {
         console.error(err);
         status.innerText = "Error: " + err.message;
       } finally {
-        downloadBtn.disabled = false;
+        btn.disabled = false;
       }
     }
   </script>

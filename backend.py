@@ -10,15 +10,13 @@ import time
 from flask_cors import CORS
 from io import BytesIO
 import threading
-
-# --- Scan Bridge v1 imports ---
-import uuid
 from datetime import datetime
+from pathlib import Path
+import re
 
 driver = None
 driver_lock = threading.Lock()
 
-# Flags for pause/stop
 pause_requested = False
 stop_requested = False
 scan_active = False
@@ -28,16 +26,43 @@ state_lock = threading.Lock()
 app = Flask(__name__)
 CORS(app)
 
-# ----------------------------
-# Helpers
-# ----------------------------
+APP_DIR = Path(__file__).resolve().parent
+SCANS_DIR = APP_DIR / "scans"
+FLS_DIR = SCANS_DIR / "scans_fls"
+E57_DIR = SCANS_DIR / "scans_e57"
+
+WRAPPER_BASE = "http://127.0.0.1:8765"
+
+def ensure_dirs():
+    FLS_DIR.mkdir(parents=True, exist_ok=True)
+    E57_DIR.mkdir(parents=True, exist_ok=True)
+
+def now_stamp():
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+def _safe_slug(name: str) -> str:
+    s = (name or "").strip().lower()
+    s = s.replace(" ", "_")
+    s = re.sub(r"[^a-z0-9_\-\.]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s or "scan"
+
+def _derive_base_from_enclosure(enclosure_filename: str) -> str:
+    """
+    enclosure_filename is typically like: IP50_Column6A_Scan_140.fls.zip
+    We want base: ip50_column6a_scan_140
+    """
+    if not enclosure_filename:
+        return "scan"
+
+    name = Path(enclosure_filename).name
+    if name.lower().endswith(".zip"):
+        name = name[:-4]
+    if name.lower().endswith(".fls"):
+        name = name[:-4]
+    return _safe_slug(name)
 
 def _get_latest_scan_info(base_url: str):
-    """
-    Returns (display_name, download_name) for the latest scan.
-    display_name: scan_info["name"] (e.g., IP50_Column6A_Scan_128)
-    download_name: enclosure file name (e.g., IP50_Column6A_Scan_128.fls.zip)
-    """
     resp = requests.get(f"{base_url}/lswebapi/scans", verify=False, timeout=15)
     resp.raise_for_status()
 
@@ -68,14 +93,62 @@ def _get_latest_scan_info(base_url: str):
     download_name = enclosure_href.split("/")[-1] if enclosure_href else None
     return display_name, download_name
 
+def _download_enclosure_to_disk(base_url: str, enclosure_filename: str, camera_suffix: str, display_name: str):
+    resp = requests.get(f"{base_url}/lswebapi/scans", verify=False, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    embedded = data.get("_embedded", {})
 
-# ----------------------------
-# FARO Scan API (your existing endpoints)
-# ----------------------------
+    target_href = None
+    for _, scan_info in embedded.items():
+        enclosure = scan_info.get("_links", {}).get("enclosure", {})
+        enclosure_href = enclosure.get("href", "")
+        enclosure_file = enclosure_href.split("/")[-1]
+        if enclosure_filename == enclosure_file:
+            target_href = enclosure_href
+            break
+
+    if not target_href:
+        raise RuntimeError(f"Remote enclosure not found: {enclosure_filename}")
+
+    download_url = f"{base_url}{target_href}"
+    file_response = requests.get(download_url, verify=False, timeout=120)
+    if file_response.status_code != 200:
+        raise RuntimeError(f"Failed to download enclosure: HTTP {file_response.status_code}")
+
+    safe_display = (display_name or "scan").replace(" ", "_")
+    local_name = f"{safe_display}_cam{camera_suffix}_{now_stamp()}_{enclosure_filename}"
+    out_path = FLS_DIR / local_name
+    out_path.write_bytes(file_response.content)
+    return str(out_path)
+
+def _convert_latest_to_e57(preferred_name: str | None = None):
+    """
+    Calls wrapper to export latest scan from DefaultProject as E57.
+    If preferred_name is provided, wrapper will rename the produced file to that.
+    Returns (run_folder_name, e57_filename)
+    """
+    payload = {"format": "e57"}
+    if preferred_name:
+        payload["out_name"] = preferred_name
+
+    r = requests.post(f"{WRAPPER_BASE}/convert/latest", json=payload, timeout=60 * 60)
+    data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+    if r.status_code != 200 or data.get("status") != "ok":
+        raise RuntimeError(f"Converter failed: {data}")
+
+    run_dir = data.get("run_dir", "")
+    primary = data.get("primary_file", "")
+    run_name = Path(run_dir).name if run_dir else ""
+    if not run_name or not primary:
+        raise RuntimeError(f"Converter returned no output: {data}")
+
+    return run_name, primary
 
 @app.route('/trigger-scan', methods=['GET'])
 def trigger_scan():
     global driver, pause_requested, stop_requested, scan_active, scan_paused
+    ensure_dirs()
 
     ip_suffix = request.args.get('ip', default='50')
     print(f"[SCAN] Starting scan for IP: {ip_suffix}")
@@ -206,6 +279,7 @@ def trigger_scan():
             return jsonify({"status": "ok", "message": "Scan stopped and deleted"}), 200
 
         display_name, download_name = _get_latest_scan_info(base_url)
+        print(f"[SCAN] Latest scan: {display_name} / {download_name}")
 
         if not download_name:
             return jsonify({
@@ -215,11 +289,29 @@ def trigger_scan():
                 "download_name": None
             }), 200
 
+        local_fls = _download_enclosure_to_disk(
+            base_url=base_url,
+            enclosure_filename=download_name,
+            camera_suffix=str(ip_suffix),
+            display_name=display_name or "unknown"
+        )
+        print(f"[SCAN] Saved FLS zip to: {local_fls}")
+
+        base = _derive_base_from_enclosure(download_name)
+        preferred_e57 = f"{base}.e57"
+
+        run_name, e57_name = _convert_latest_to_e57(preferred_name=preferred_e57)
+        print(f"[SCAN] Converted E57: run={run_name}, file={e57_name}")
+
         return jsonify({
             "status": "ok",
-            "message": "Scan complete",
+            "message": "Scan complete and converted",
             "file_name": display_name or "unknown",
-            "download_name": download_name
+            "download_name": download_name,
+            "local_fls": local_fls,
+            "e57_run": run_name,
+            "e57_name": e57_name,
+            "e57_preferred": preferred_e57
         }), 200
 
     except Exception as e:
@@ -236,7 +328,6 @@ def trigger_scan():
             driver = None
         return Response(f"Error occurred: {str(e)}", status=500)
 
-
 @app.route('/pause-scan', methods=['GET'])
 def pause_scan():
     global pause_requested, scan_active
@@ -246,7 +337,6 @@ def pause_scan():
         pause_requested = True
     print("[API] Pause requested")
     return jsonify({"status": "ok", "message": "Pause requested"}), 200
-
 
 @app.route('/stop-scan', methods=['GET'])
 def stop_scan():
@@ -258,166 +348,29 @@ def stop_scan():
     print("[API] Stop requested")
     return jsonify({"status": "ok", "message": "Stop requested"}), 200
 
+@app.route("/download-e57", methods=["GET"])
+def download_e57():
+    run = request.args.get("run", "")
+    name = request.args.get("name", "")
+    if not run or not name:
+        return jsonify({"status": "error", "message": "run and name are required"}), 400
 
-@app.route('/download-file', methods=['GET'])
-def download_file():
-    ip_suffix = request.args.get('ip', default='50')
-    base_url = f"https://141.70.213.{ip_suffix}"
-    file_name = request.args.get('name')
+    url = f"{WRAPPER_BASE}/download"
+    r = requests.get(url, params={"run": run, "name": name}, timeout=300)
+    if r.status_code != 200:
+        return jsonify({"status": "error", "message": f"Wrapper download failed: {r.status_code}"}), 502
 
-    print(f"[DOWNLOAD] Requesting file: {file_name}")
-
-    if not file_name:
-        return jsonify({"status": "error", "message": "Missing file name"}), 400
-
-    try:
-        response = requests.get(f"{base_url}/lswebapi/scans", verify=False, timeout=15)
-        if response.status_code != 200:
-            return jsonify({"status": "error", "message": "Failed to fetch scan list"}), 502
-
-        data = response.json()
-        embedded = data.get("_embedded", {})
-        target_href = None
-
-        for _, scan_info in embedded.items():
-            enclosure = scan_info.get("_links", {}).get("enclosure", {})
-            enclosure_href = enclosure.get("href", "")
-            enclosure_file = enclosure_href.split("/")[-1]
-            if file_name == enclosure_file:
-                target_href = enclosure_href
-                break
-
-        if not target_href:
-            return jsonify({"status": "error", "message": "File not found on remote server"}), 404
-
-        download_url = f"{base_url}{target_href}"
-        print(f"[DOWNLOAD] Downloading from: {download_url}")
-
-        file_response = requests.get(download_url, verify=False, timeout=60)
-        if file_response.status_code != 200:
-            return jsonify({"status": "error", "message": "Failed to download file"}), 502
-
-        return send_file(
-            BytesIO(file_response.content),
-            download_name=file_name,
-            as_attachment=True,
-            mimetype="application/zip"
-        )
-
-    except Exception as e:
-        print(f"[DOWNLOAD] ERROR: {repr(e)}")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-# ----------------------------
-# Scan Bridge v1 (Ubuntu job queue)
-# ----------------------------
-
-jobs = {}       # job_id -> job dict
-job_queue = []  # ordered job ids
-jobs_lock = threading.Lock()
-
-def now_iso():
-    return datetime.utcnow().isoformat() + "Z"
-
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"}), 200
-
-
-@app.route("/bridge/jobs", methods=["POST"])
-def bridge_create_job():
-    payload = request.get_json(force=True, silent=True) or {}
-
-    camera_ip_suffix = str(payload.get("camera_ip_suffix", "50"))
-    workspace = payload.get("workspace")
-    outdir = payload.get("outdir")
-    scan_index = payload.get("scan_index", None)  # optional
-
-    if not workspace or not outdir:
-        return jsonify({"status": "error", "message": "workspace and outdir are required"}), 400
-
-    job_id = str(uuid.uuid4())
-    job = {
-        "job_id": job_id,
-        "state": "QUEUED",
-        "created_at": now_iso(),
-        "updated_at": now_iso(),
-        "assigned_to": None,
-
-        "camera_ip_suffix": camera_ip_suffix,
-        "workspace": workspace,
-        "outdir": outdir,
-        "scan_index": scan_index,
-
-        "ok": None,
-        "exit_code": None,
-        "stdout": "",
-        "stderr": "",
-        "output_files": [],
-    }
-
-    with jobs_lock:
-        jobs[job_id] = job
-        job_queue.append(job_id)
-
-    return jsonify({"status": "ok", "job_id": job_id, "job": job}), 200
-
-
-@app.route("/bridge/jobs/next", methods=["GET"])
-def bridge_next_job():
-    worker = request.args.get("worker", "unknown")
-
-    with jobs_lock:
-        for job_id in job_queue:
-            job = jobs.get(job_id)
-            if job and job["state"] == "QUEUED":
-                job["state"] = "RUNNING"
-                job["assigned_to"] = worker
-                job["updated_at"] = now_iso()
-                return jsonify({"status": "ok", "job": job}), 200
-
-    return jsonify({"status": "ok", "job": None}), 200
-
-
-@app.route("/bridge/jobs/<job_id>/complete", methods=["POST"])
-def bridge_complete_job(job_id):
-    payload = request.get_json(force=True, silent=True) or {}
-
-    with jobs_lock:
-        job = jobs.get(job_id)
-        if not job:
-            return jsonify({"status": "error", "message": "job not found"}), 404
-
-        job["ok"] = bool(payload.get("ok", False))
-        job["exit_code"] = payload.get("exit_code")
-        job["stdout"] = (payload.get("stdout", "") or "")[:200000]
-        job["stderr"] = (payload.get("stderr", "") or "")[:200000]
-        job["output_files"] = payload.get("output_files", []) or []
-
-        job["state"] = "DONE" if job["ok"] else "FAILED"
-        job["updated_at"] = now_iso()
-
-    return jsonify({"status": "ok", "job": job}), 200
-
-
-@app.route("/bridge/jobs/<job_id>", methods=["GET"])
-def bridge_get_job(job_id):
-    with jobs_lock:
-        job = jobs.get(job_id)
-        if not job:
-            return jsonify({"status": "error", "message": "job not found"}), 404
-        return jsonify({"status": "ok", "job": job}), 200
-
+    return send_file(
+        BytesIO(r.content),
+        download_name=name,
+        as_attachment=True,
+        mimetype="application/octet-stream"
+    )
 
 @app.route('/')
 def serve_html():
     return send_file("index.html")
 
-
 if __name__ == '__main__':
-    # IMPORTANT for Windows to access your Ubuntu server:
-    # - host="0.0.0.0" listens on LAN
-    # - keep port 5000 unless you changed it
+    ensure_dirs()
     app.run(debug=True, host="0.0.0.0", port=5000, threaded=True)

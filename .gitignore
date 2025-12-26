@@ -38,3 +38,14 @@ Release/
 *.pdb
 *.exe
 *.dll
+
+scans/
+scans/scans_fls/
+scans/scans_e57/
+scans/workspaces/
+*.e57
+*.fls
+*.zip
+run_*/
+run_*/
+PC-automate/index-modern.html
